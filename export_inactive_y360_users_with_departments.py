@@ -2,7 +2,7 @@
 """Export inactive Yandex 360 users with their current departments.
 
 Only the Python standard library is required. Statistics are processed page by
-page, so memory usage grows with the number of users, not with user-days.
+page. Per-user date sets are retained to check coverage and duplicate days.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from collections import Counter
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -61,6 +63,11 @@ OUTPUT_FIELDS = (
     "report_start_date",
     "report_end_date",
     "statistics_rows_checked",
+    "created_at", "cutoff_date", "last_activity_date",
+    "classification", "classification_reason", "inactive_candidate",
+    "statistics_status", "statistics_days_checked", "report_timezone",
+    "directory_is_enabled", "is_robot", "is_dismissed",
+    "mail_received_in_period",
     *LAST_USAGE_FIELDS,
 )
 
@@ -75,6 +82,9 @@ class UserStatisticsState:
     latest_row_date: str = ""
     rows_checked: int = 0
     has_activity: bool = False
+    row_dates: set[date] = field(default_factory=set)
+    issues: set[str] = field(default_factory=set)
+    mail_received: bool = False
     last_usage_dates: dict[str, str | None] = field(
         default_factory=lambda: {name: None for name in LAST_USAGE_FIELDS}
     )
@@ -109,11 +119,6 @@ def parse_iso_date(value: str, argument_name: str) -> date:
 def validate_period(start_date: date, end_date: date) -> None:
     if start_date > end_date:
         raise ScriptError("Начальная дата не может быть позже конечной даты.")
-    if end_date >= date.today():
-        raise ScriptError(
-            "Конечная дата должна быть раньше текущего дня: статистика за сегодня "
-            "станет доступна только завтра."
-        )
 
 
 def normalize_id(value: Any) -> str | None:
@@ -267,9 +272,9 @@ def fetch_departments(
     return result, pages
 
 
-def fetch_user_departments(
+def fetch_users(
     token: str, org_id: str, timeout: int
-) -> tuple[dict[str, str | None], int]:
+) -> tuple[dict[str, dict[str, Any]], int]:
     users, pages = fetch_directory_collection(
         url=USERS_URL.format(org_id=org_id),
         collection_name="users",
@@ -277,12 +282,12 @@ def fetch_user_departments(
         timeout=timeout,
         page_size=USER_PAGE_SIZE,
     )
-    result: dict[str, str | None] = {}
+    result: dict[str, dict[str, Any]] = {}
     for user in users:
         user_id = normalize_id(user.get("id"))
         if user_id is None:
             raise ScriptError("В справочнике найден пользователь без поля id.")
-        result[user_id] = normalize_id(user.get("departmentId"))
+        result[user_id] = user
     return result, pages
 
 
@@ -302,31 +307,6 @@ def value_is_nonzero(value: Any) -> bool:
     return bool(value)
 
 
-def usage_date_is_in_period(value: Any, start_date: date, end_date: date) -> bool:
-    if value is None or value == "":
-        return False
-    if not isinstance(value, str):
-        return True
-    try:
-        usage_date = date.fromisoformat(value)
-    except ValueError:
-        # Unknown non-empty values must not be silently treated as inactivity.
-        return True
-    return start_date <= usage_date <= end_date
-
-
-def row_has_activity(item: dict[str, Any], start_date: date, end_date: date) -> bool:
-    for field_name, value in item.items():
-        if not field_name.startswith(SERVICE_PREFIXES):
-            continue
-        if field_name.endswith("_last_usage_date"):
-            if usage_date_is_in_period(value, start_date, end_date):
-                return True
-        elif value_is_nonzero(value):
-            return True
-    return False
-
-
 def update_statistics_state(
     states: dict[str, UserStatisticsState],
     item: dict[str, Any],
@@ -335,36 +315,46 @@ def update_statistics_state(
 ) -> None:
     user_id = normalize_id(item.get("user_id"))
     if user_id is None:
-        raise ScriptError("В одной из строк статистики отсутствует user_id.")
-
+        raise ScriptError("В строке статистики отсутствует user_id.")
     state = states.setdefault(user_id, UserStatisticsState())
     state.rows_checked += 1
-    if state.has_activity:
+    try:
+        row_date = date.fromisoformat(item["date"])
+        if not start_date <= row_date <= end_date:
+            raise ValueError()
+    except (KeyError, TypeError, ValueError):
+        state.issues.add("invalid_row_date")
         return
-
-    row_date = str(item.get("date") or "")
-    if not state.identity or row_date >= state.latest_row_date:
+    if row_date in state.row_dates:
+        state.issues.add("duplicate_row_date")
+    state.row_dates.add(row_date)
+    if not state.identity or row_date.isoformat() >= state.latest_row_date:
         state.identity = {name: item.get(name) for name in IDENTITY_FIELDS}
-        state.identity["user_id"] = user_id
-        state.latest_row_date = row_date
-
-    for field_name in LAST_USAGE_FIELDS:
-        value = item.get(field_name)
-        if value in (None, ""):
+        state.latest_row_date = row_date.isoformat()
+    state.mail_received |= value_is_nonzero(item.get("mail_received_letters_count"))
+    for name in LAST_USAGE_FIELDS:
+        if name not in item:
+            state.issues.add("missing_usage_field:" + name)
             continue
-        value_as_string = str(value)
-        current_value = state.last_usage_dates[field_name]
-        if current_value is None or value_as_string > current_value:
-            state.last_usage_dates[field_name] = value_as_string
+        value = item[name]
+        if value is None or value == "":
+            continue
+        try:
+            usage = date.fromisoformat(value)
+        except (TypeError, ValueError):
+            state.issues.add("invalid_usage_date:" + name)
+            continue
+        if usage > end_date:
+            state.issues.add("usage_after_report_end:" + name)
+            continue
+        previous = state.last_usage_dates[name]
+        if previous is None or usage.isoformat() > previous:
+            state.last_usage_dates[name] = usage.isoformat()
+        if usage >= start_date:
+            state.has_activity = True
 
-    if row_has_activity(item, start_date, end_date):
-        state.has_activity = True
-        # Identity and usage dates are not needed for users excluded from output.
-        state.identity.clear()
-        state.last_usage_dates.clear()
 
-
-def stream_statistics(
+def stream_statistics_chunk(
     *,
     token: str,
     org_id: str,
@@ -372,11 +362,13 @@ def stream_statistics(
     end_date: date,
     limit: int,
     timeout: int,
+    states: dict[str, UserStatisticsState],
+    report_start: date,
+    report_end: date,
 ) -> tuple[dict[str, UserStatisticsState], int, int]:
     base_url = STATISTICS_URL.format(org_id=org_id)
     iteration_key = ""
     seen_iteration_keys: set[str] = set()
-    states: dict[str, UserStatisticsState] = {}
     rows_total = 0
     pages_total = 0
 
@@ -403,7 +395,7 @@ def stream_statistics(
                     f"Страница статистики {pages_total} содержит элемент "
                     "неожиданного формата."
                 )
-            update_statistics_state(states, item, start_date, end_date)
+            update_statistics_state(states, item, report_start, report_end)
             rows_total += 1
 
         next_key = payload.get("iteration_key") or ""
@@ -417,6 +409,23 @@ def stream_statistics(
         iteration_key = next_key
 
     return states, rows_total, pages_total
+
+
+def stream_statistics(*, token, org_id, start_date, end_date, limit, timeout):
+    states = {}
+    rows = pages = 0
+    chunk_start = start_date
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=27), end_date)
+        part, nr, np = stream_statistics_chunk(
+            token=token, org_id=org_id, start_date=chunk_start,
+            end_date=chunk_end, limit=limit, timeout=timeout,
+            states=states, report_start=start_date, report_end=end_date,
+        )
+        rows += nr
+        pages += np
+        chunk_start = chunk_end + timedelta(days=1)
+    return states, rows, pages
 
 
 def resolve_department(
@@ -445,49 +454,83 @@ def resolve_department(
     return department_id, department_name, "ok"
 
 
+def classify(user, state, start_date, end_date, report_tz):
+    if user is None:
+        return "insufficient_data", "user_not_in_directory"
+    if user.get("isRobot") is True:
+        return "excluded", "service_account"
+    if user.get("isDismissed") is True:
+        return "excluded", "dismissed"
+    if user.get("isEnabled") is False:
+        return "excluded", "blocked"
+    try:
+        created = datetime.fromisoformat(user["createdAt"].replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError()
+        created_date = created.astimezone(report_tz).date()
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return "insufficient_data", "invalid_or_missing_created_at"
+    if created_date > end_date:
+        return "excluded", "created_after_report_end"
+    if created_date >= start_date:
+        return "new_account", "created_on_or_after_cutoff"
+    if state is None:
+        return "insufficient_data", "no_statistics"
+    if state.has_activity:
+        return "active", "usage_in_period"
+    if state.issues:
+        return "insufficient_data", ";".join(sorted(state.issues))
+    if len(state.row_dates) != (end_date - start_date).days + 1:
+        return "insufficient_data", "incomplete_daily_coverage"
+    if any(state.last_usage_dates.values()):
+        return "inactive", "all_known_usage_before_cutoff"
+    return "no_activity_recorded", "all_usage_dates_empty"
+
+
 def build_inactive_rows(
-    *,
-    states: dict[str, UserStatisticsState],
-    user_departments: dict[str, str | None],
-    departments: dict[str, str],
-    start_date: date,
-    end_date: date,
-) -> tuple[list[dict[str, Any]], DepartmentLookupCounters]:
-    rows: list[dict[str, Any]] = []
+    *, states, users, departments, start_date, end_date,
+    report_tz=timezone.utc,
+):
+    rows = []
     counters = DepartmentLookupCounters()
-
-    for user_id, state in states.items():
-        if state.has_activity:
-            continue
+    user_departments = {uid: normalize_id(u.get("departmentId")) for uid, u in users.items()}
+    for user_id in sorted(set(users) | set(states)):
+        state = states.get(user_id)
+        user = users.get(user_id)
+        status, reason = classify(user, state, start_date, end_date, report_tz)
         department_id, department_name, lookup_status = resolve_department(
-            user_id=user_id,
-            user_departments=user_departments,
-            departments=departments,
-            counters=counters,
+            user_id=user_id, user_departments=user_departments,
+            departments=departments, counters=counters,
         )
-        row = dict(state.identity)
-        row.update(
-            {
-                "user_id": user_id,
-                "department_id": department_id,
-                "department_name": department_name,
-                "department_lookup_status": lookup_status,
-                "report_start_date": start_date.isoformat(),
-                "report_end_date": end_date.isoformat(),
-                "statistics_rows_checked": state.rows_checked,
-            }
-        )
-        row.update(state.last_usage_dates)
+        row = dict(state.identity) if state else {}
+        directory = user or {}
+        row.setdefault("nickname", directory.get("nickname"))
+        if not row.get("name"):
+            name = directory.get("name") or {}
+            row["name"] = " ".join(str(name.get(k) or "") for k in ("last", "first", "middle")).strip()
+        dates = state.last_usage_dates if state else dict.fromkeys(LAST_USAGE_FIELDS)
+        issues = sorted(state.issues) if state else []
+        coverage_ok = bool(state and len(state.row_dates) == (end_date-start_date).days+1)
+        row.update({
+            "user_id": user_id, "department_id": department_id,
+            "department_name": department_name, "department_lookup_status": lookup_status,
+            "report_start_date": start_date.isoformat(), "report_end_date": end_date.isoformat(),
+            "statistics_rows_checked": state.rows_checked if state else 0,
+            "statistics_days_checked": len(state.row_dates) if state else 0,
+            "statistics_status": "no_statistics" if state is None else (
+                ";".join(issues) if issues else ("ok" if coverage_ok else "incomplete_daily_coverage")),
+            "created_at": directory.get("createdAt"), "cutoff_date": start_date.isoformat(),
+            "last_activity_date": max((v for v in dates.values() if v), default=None),
+            "classification": status, "classification_reason": reason,
+            "inactive_candidate": status in ("inactive", "no_activity_recorded"),
+            "report_timezone": str(report_tz),
+            "directory_is_enabled": directory.get("isEnabled"),
+            "is_robot": directory.get("isRobot"), "is_dismissed": directory.get("isDismissed"),
+            "mail_received_in_period": state.mail_received if state else None,
+        })
+        row.update(dates)
         rows.append(row)
-
-    rows.sort(
-        key=lambda row: (
-            str(row.get("department_name") or "").casefold(),
-            str(row.get("name") or "").casefold(),
-            str(row.get("nickname") or "").casefold(),
-            str(row.get("user_id") or ""),
-        )
-    )
+    rows.sort(key=lambda r: (str(r["department_name"]).casefold(), str(r.get("name") or "").casefold(), r["user_id"]))
     return rows, counters
 
 
@@ -541,6 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=60,
         help="Тайм-аут одного запроса в секундах (по умолчанию: 60)",
     )
+    parser.add_argument("--all-users", action="store_true", help="Выгрузить все статусы, включая недостаточные данные")
+    parser.add_argument("--timezone", default="Europe/Moscow", help="Часовой пояс календарных границ (по умолчанию Europe/Moscow)")
     return parser
 
 
@@ -560,9 +605,15 @@ def main() -> int:
 
         start_date = parse_iso_date(args.start_date, "start_date")
         end_date = parse_iso_date(args.end_date, "end_date")
+        try:
+            report_tz = ZoneInfo(args.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ScriptError("Неизвестный часовой пояс; проверьте --timezone и наличие базы tzdata.") from exc
         validate_period(start_date, end_date)
+        if end_date >= datetime.now(report_tz).date():
+            raise ScriptError("Конец периода должен быть раньше сегодня в часовом поясе отчёта.")
         output_path = args.output or Path(
-            f"inactive_y360_users_{start_date}_{end_date}.{args.format}"
+            f"{'all' if args.all_users else 'inactive'}_y360_users_{start_date}_{end_date}.{args.format}"
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -570,7 +621,7 @@ def main() -> int:
         departments, department_pages = fetch_departments(token, org_id, args.timeout)
 
         print("Получение справочника пользователей...", file=sys.stderr)
-        user_departments, user_pages = fetch_user_departments(token, org_id, args.timeout)
+        users, user_pages = fetch_users(token, org_id, args.timeout)
 
         print("Получение и обработка статистики...", file=sys.stderr)
         states, statistics_rows, statistics_pages = stream_statistics(
@@ -583,22 +634,27 @@ def main() -> int:
         )
         inactive_rows, lookup_counters = build_inactive_rows(
             states=states,
-            user_departments=user_departments,
+            users=users,
             departments=departments,
             start_date=start_date,
             end_date=end_date,
+            report_tz=report_tz,
         )
 
+        totals = Counter(row["classification"] for row in inactive_rows)
+        print("Классификация: " + json.dumps(dict(totals), ensure_ascii=False))
+        if not args.all_users:
+            inactive_rows = [row for row in inactive_rows if row["inactive_candidate"]]
         if args.format == "csv":
             write_csv(output_path, inactive_rows)
         else:
             write_json(output_path, inactive_rows)
 
         print(f"Получено подразделений: {len(departments)} ({department_pages} стр.)")
-        print(f"Получено пользователей справочника: {len(user_departments)} ({user_pages} стр.)")
+        print(f"Получено пользователей справочника: {len(users)} ({user_pages} стр.)")
         print(f"Получено строк статистики: {statistics_rows} ({statistics_pages} стр.)")
         print(f"Проверено пользователей статистики: {len(states)}")
-        print(f"Пользователей без активности: {len(inactive_rows)}")
+        print(f"Строк в выгрузке: {len(inactive_rows)}")
         print(
             "Не удалось определить подразделение: "
             f"{lookup_counters.problems_total} "
